@@ -6,6 +6,7 @@ TOK = os.environ.get("SEARCH_PAT") or os.environ.get("GITHUB_TOKEN") or ""
 API = "https://api.github.com"
 UA = {"User-Agent": "curl/8.5.0", "Accept": "application/vnd.github+json"}
 T0 = time.time()
+BUDGET = 780
 
 Q = [
     'filename:.env size:<8000',
@@ -31,15 +32,27 @@ F = [
 ]
 
 
-def api(path):
-    r = urllib.request.Request(API + path, headers=dict(UA, Authorization="token " + TOK))
-    try:
-        with urllib.request.urlopen(r, timeout=25) as resp:
-            return 200, json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return e.code, e.read(400).decode("utf-8", "ignore")
-    except Exception as e:
-        return 0, repr(e)[:80]
+def api(path, tries=4):
+    for attempt in range(tries):
+        r = urllib.request.Request(API + path, headers=dict(UA, Authorization="token " + TOK))
+        try:
+            with urllib.request.urlopen(r, timeout=25) as resp:
+                return 200, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read(400).decode("utf-8", "ignore")
+            wait = 40
+            m = re.search(r"try again in (\d+)", body)
+            if m:
+                wait = min(int(m.group(1)) + 3, 120)
+            if e.code in (429, 403) and attempt < tries - 1 and time.time() - T0 < BUDGET - 30:
+                print("wait %ds (%d) %s" % (wait, e.code, path[:60]))
+                time.sleep(wait)
+                continue
+            return e.code, body
+        except Exception as e:
+            time.sleep(5)
+            body = repr(e)[:80]
+    return 0, body
 
 
 def raw(url, to=20, cap=250000):
@@ -66,33 +79,31 @@ def scan(item):
 
 
 def main():
-    print("SWEEP-START toklen=%d" % len(TOK))
-    c, who = api("/user")
-    print("whois", c, (who.get("login") if isinstance(who, dict) else str(who)[:120]))
+    print("SWEEP-START")
     seen, hits, errs = set(), [], []
     for q in Q:
-        if time.time() - T0 > 700:
+        if time.time() - T0 > BUDGET:
             print("budget out")
             break
         for page in (1, 2, 3):
+            if time.time() - T0 > BUDGET:
+                break
             c, d = api("/search/code?q=%s&per_page=50&page=%d" % (urllib.parse.quote(q), page))
             if c != 200:
                 errs.append([q, page, c, d if isinstance(d, str) else ""])
-                print("ERR", c, q, page, (d if isinstance(d, str) else "")[:200])
-                if c in (403, 429):
-                    time.sleep(30)
+                print("ERR", c, q, page)
                 break
             items = [i for i in d.get("items", []) if i["repository"]["full_name"] not in seen]
             for i in items:
                 seen.add(i["repository"]["full_name"])
-            print("page %d/%s -> %d items" % (page, q, len(items)))
+            print("page %d %s -> %d" % (page, q, len(items)))
             with ThreadPoolExecutor(max_workers=16) as ex:
                 for res in ex.map(scan, items):
                     hits.extend(res)
             if len(items) < 50:
                 break
-            time.sleep(4)
-        time.sleep(6)
+            time.sleep(8)
+        time.sleep(10)
     uniq = {}
     for h in hits:
         uniq[h["v"]] = h
