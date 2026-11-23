@@ -1,5 +1,8 @@
 name: scan
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 */3 * * *'
 permissions:
   contents: read
 jobs:
