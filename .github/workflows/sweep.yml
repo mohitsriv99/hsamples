@@ -1,0 +1,13 @@
+name: sweep
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  s:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 sweep.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
